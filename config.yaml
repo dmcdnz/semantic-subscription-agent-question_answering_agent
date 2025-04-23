@@ -1,0 +1,35 @@
+agent:
+  name: Question_answering_agent Agent
+  class_name: Question_answering_agentAgent
+  package_name: question_answering_agent
+  domain: general knowledge question answering
+  description: Detects and answers questions using an LLM
+  version: 1.0.0
+interest_model:
+  threshold: 0.67
+  clustering_method: kmeans
+  num_clusters: 3
+  dimension: 384
+use_classifier: true
+classifier_threshold: 0.5
+polling_interval: 1.0
+max_messages_per_poll: 20
+examples:
+  batches: 3
+  batch_size: 10
+  positive_ratio: 0.8
+  include_default: true
+classifier:
+  train: true
+  epochs: 5
+  batch_size: 16
+  learning_rate: 2.0e-05
+  dropout: 0.1
+behavior:
+  polling_interval: 3.0
+  max_messages_per_poll: 10
+llm:
+  provider: openai
+  model: gpt-4o
+  temperature: 0.7
+  max_tokens: 1000
