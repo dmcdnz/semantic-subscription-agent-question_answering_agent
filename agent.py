@@ -1,42 +1,61 @@
 #!/usr/bin/env python
 
 """
-Question_answering_agent Agent Implementation
+Question Answering Agent Implementation
 
-Detects and answers questions using an LLM
+Detects and answers questions using an LLM. The agent identifies questions based on both
+natural language patterns and vector similarity, then uses an LLM to generate accurate
+and helpful answers.
 """
 
 import json
 import logging
 import os
 import re
-from typing import Dict, Any, Optional
+import asyncio
+import time
+from typing import Dict, Any, Optional, List, Union
 
 # For containerized agents, use the local base agent
 # This avoids dependencies on the semsubscription module
 try:
     # First try to import from semsubscription if available (for local development)
-    from semsubscription.agents.EnhancedAgent import EnhancedAgent as BaseAgent
+    from semsubscription.agents.llm_agent import LLMAgent
+    from semsubscription.vector_db.database import Message
+    from semsubscription.memory.vector_memory import get_memory_system
 except ImportError:
     try:
         # Fall back to local agent_base for containerized environments using relative import
-        from .agent_base import BaseAgent
+        from .agent_base import BaseAgent as LLMAgent  # Use BaseAgent if LLMAgent is not available
+        from .message import Message  # Local implementation of Message
+        # Define a dummy get_memory_system function if not available
+        def get_memory_system():
+            return None
     except ImportError:
         # Last resort for Docker environment with current directory
         import sys
-        import os
-        # Add the current directory to the path to find agent_base.py
         sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-        from agent_base import BaseAgent
+        from agent_base import BaseAgent as LLMAgent  # Use BaseAgent if LLMAgent is not available
+        # Create a simple Message class if not available
+        class Message:
+            def __init__(self, content=""):
+                self.content = content
+        # Define a dummy get_memory_system function
+        def get_memory_system():
+            return None
 
 logger = logging.getLogger(__name__)
 
-class Question_answering_agentAgent(BaseAgent):
+class QuestionAnsweringAgent(LLMAgent):
     """
-    Agent that detects and answers questions using an llm
+    Agent that detects and answers questions using an LLM
+    
+    This agent specializes in identifying questions in natural language and providing
+    accurate, helpful answers using an LLM. It uses both pattern matching and
+    vector similarity to determine if a message contains a question.
     """
     
-    def __init__(self, agent_id=None, name=None, description=None, similarity_threshold=0.7, **kwargs):
+    def __init__(self, agent_id=None, name=None, description=None, similarity_threshold=0.6, **kwargs):
         """
         Initialize the agent with its parameters and setup the classifier
         
@@ -47,7 +66,7 @@ class Question_answering_agentAgent(BaseAgent):
             similarity_threshold: Threshold for similarity-based interest determination
         """
         # Set default name if not provided
-        name = name or "Question_answering_agent Agent"
+        name = name or "Question Answering Agent"
         description = description or "Detects and answers questions using an LLM"
         
         # Call parent constructor
@@ -61,118 +80,374 @@ class Question_answering_agentAgent(BaseAgent):
             **kwargs
         )
         
+        # Configure agent settings
+        custom_config = self.config.get('custom', {}) if hasattr(self, 'config') else {}
+        self.max_answer_length = custom_config.get('max_answer_length', 1500)
+        self.answer_format = custom_config.get('answer_format', 'markdown')
+        
+        # Initialize question patterns
+        self.question_patterns = [
+            re.compile(r'^(?:what|who|where|when|why|how|is|are|can|could|would|will|should)', re.IGNORECASE),
+            re.compile(r'.*\?$', re.IGNORECASE)
+        ]
+        
         logger.info(f"{name} agent initialized")
     
     def setup_interest_model(self):
         """
-        Set up the agent's interest model, which determines what messages it processes
-        This is called automatically during initialization
+        Configure the agent's interest model with domain-specific knowledge
         """
-        # Check for fine-tuned model directory
+        # Don't call super().setup_interest_model() if creating custom interest model
+        
+        # Get the path to the fine-tuned model
         model_path = os.path.join(os.path.dirname(__file__), "fine_tuned_model")
-        if os.path.exists(model_path) and os.path.isdir(model_path):
+        logger.info(f"Using fine-tuned model from: {model_path}")
+        
+        try:
+            # Import necessary components for fine-tuned model
             try:
-                # Import necessary components for fine-tuned model
+                # First try importing from semsubscription
+                from semsubscription.vector_db.embedding import EmbeddingEngine, InterestModel
+            except ImportError:
+                # Fall back to local implementation for containerized environments
                 try:
-                    # First try importing from semsubscription
-                    from semsubscription.vector_db.embedding import EmbeddingEngine, InterestModel
-                except ImportError:
-                    # Fall back to local implementation for containerized environments
                     from .interest_model import CustomInterestModel as InterestModel
                     from .embedding_engine import EmbeddingEngine
-                
-                logger.info(f"Using fine-tuned model from: {model_path}")
-                
+                except ImportError:
+                    # Last resort fallback
+                    from interest_model import CustomInterestModel as InterestModel
+                    from embedding_engine import EmbeddingEngine
+            
+            if os.path.exists(model_path) and os.path.isdir(model_path):
                 # Create embedding engine with the fine-tuned model
                 embedding_engine = EmbeddingEngine(model_name=model_path)
-                logger.info(f"Successfully loaded fine-tuned model")
+                logger.info(f"Successfully loaded fine-tuned model with dimension: {embedding_engine.get_dimension() if hasattr(embedding_engine, 'get_dimension') else 'unknown'}")
                 
                 # Create interest model with the custom embedding engine
                 self.interest_model = InterestModel(embedding_engine=embedding_engine)
+                
+                # Lower the threshold to catch more potential questions
+                self.similarity_threshold = 0.5  # Lower from default
                 self.interest_model.threshold = self.similarity_threshold
+                logger.info(f"Set similarity threshold to {self.similarity_threshold}")
                 
-                # Domain-specific keywords can be added here
-                # self.interest_model.keywords.extend([
-                #     "specific_keyword",
-                #     "another_keyword"
-                # ])
+                # Add question-related keywords for backup matching
+                self.interest_model.keywords = [
+                    'question', 'answer', 'how', 'what', 'when', 'where', 'why',
+                    'who', 'which', 'whose', 'explain', 'tell me', 'describe',
+                    'help me understand', '?'
+                ]
                 
-                return  # Exit early, we've set up the model successfully
-            except Exception as e:
-                logger.error(f"Error setting up fine-tuned model: {e}")
-                logger.warning("Falling back to default interest model setup")
+                # Get question patterns from config
+                if hasattr(self, 'config') and 'question_patterns' in self.config.get('custom', {}):
+                    pattern_strings = self.config['custom']['question_patterns']
+                    self.question_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in pattern_strings]
+                
+                # Train with example questions
+                examples = [
+                    "What is the capital of France?",
+                    "How does photosynthesis work?",
+                    "Can you explain quantum computing?",
+                    "Who wrote Pride and Prejudice?",
+                    "When was the first computer invented?",
+                    "Why is the sky blue?",
+                    "Tell me about the history of chocolate",
+                    "What's the difference between machine learning and AI?",
+                    "How far is the moon from earth?",
+                    "What are the main challenges of climate change?"
+                ]
+                
+                # Force retraining of interest model to ensure vectors are stored properly
+                logger.info(f"Training question answering agent with {len(examples)} examples using fine-tuned model")
+                if hasattr(self.interest_model, 'interest_vectors'):
+                    self.interest_model.interest_vectors = []  # Clear any existing vectors
+                if examples and len(examples) > 0:
+                    self.interest_model.train(examples, method="average")  # Use simpler averaging method
+            else:
+                logger.warning(f"Fine-tuned model directory not found at {model_path}, falling back to default setup")
+                super().setup_interest_model()
+                
+        except Exception as e:
+            logger.error(f"Error setting up fine-tuned model: {e}")
+            # Fall back to default setup if fine-tuned model fails
+            super().setup_interest_model()
+            logger.warning("Fell back to default interest model setup due to error with fine-tuned model")
+    
+    def is_interested(self, message: Message) -> bool:
+        """
+        Determine if the message contains a question
         
-        # Fall back to standard setup if fine-tuned model doesn't exist or fails
-        super().setup_interest_model()
+        Args:
+            message: The message to check
+            
+        Returns:
+            True if the message contains a question, False otherwise
+        """
+        # Check if a classifier decision has already been made
+        if hasattr(message, 'classifier_decision'):
+            return message.classifier_decision
         
-        # Add domain-specific customizations to the default model
-        # For example, to add keywords that should always be of interest:
-        # self.interest_model.keywords.extend([
-        #     "specific_keyword",
-        #     "another_keyword"
-        # ])
+        # Get the message content - handle both direct strings and structured messages
+        content = message.content
+        if isinstance(content, dict) and 'message' in content:
+            content = content['message']
+        elif isinstance(content, dict) and 'content' in content:
+            content = content['content']
+        
+        if not isinstance(content, str):
+            # Try to convert to string if possible
+            try:
+                content = str(content)
+            except:
+                logger.warning(f"Cannot process non-string message content: {type(content)}")
+                return False
+            
+        # Try pattern matching first for efficiency
+        for pattern in self.question_patterns:
+            if pattern.search(content):
+                logger.info(f"Question pattern match: {content[:50]}...")
+                return True
+                
+        # Try keyword matching as a fallback
+        content_lower = content.lower()
+        for keyword in self.interest_model.keywords:
+            if keyword.lower() in content_lower:
+                logger.info(f"Question keyword match on '{keyword}': {content[:50]}...")
+                return True
+        
+        # Fall back to the standard interest determination
+        return super().is_interested(message)
+        
+
+    
+    async def process_message_async(self, message: Message) -> Optional[Dict[str, Any]]:
+        """
+        Process questions using LLM and retrieve relevant context
+        
+        Args:
+            message: The message to process
+            
+        Returns:
+            Response data with the answer
+        """
+        try:
+            # Extract the question from the message
+            if hasattr(message, 'content'):
+                question = message.content.strip()
+                message_id = getattr(message, 'id', 'unknown')
+            else:
+                question = message.get('content', '').strip()
+                message_id = message.get('id', 'unknown')
+            
+            # Skip if there is no question (shouldn't happen due to interest check)
+            if not question:
+                return None
+                
+            start_time = time.time()
+            logger.info(f"Processing question: {question[:100]}...")
+            
+            # Get relevant context from memory system if available
+            memory_context = self._retrieve_relevant_context(question)
+            
+            # If no memory context available and LLM is available, use it directly
+            if not memory_context and hasattr(self, 'llm') and self.llm:
+                try:
+                    result = await super().process_message_async(message)
+                    result["processing_time"] = round(time.time() - start_time, 2)
+                    result["source"] = "llm_direct"
+                    return result
+                except Exception as e:
+                    logger.error(f"Error in LLM processing: {e}")
+                    return self.process_message(message)  # Fall back to standard processing
+                    
+            # Prepare enhanced context for the LLM
+            system_prompt = self._get_enhanced_system_prompt(memory_context)
+            
+            # Call the LLM with the enhanced prompt and context
+            if hasattr(self, 'llm') and self.llm:
+                try:
+                    llm_response = await self.llm.complete_chat(
+                        system_prompt=system_prompt,
+                        messages=[{"role": "user", "content": question}],
+                        temperature=self.config.get('llm', {}).get('temperature', 0.7) if hasattr(self, 'config') else 0.7,
+                        max_tokens=min(self.max_answer_length, 
+                                      self.config.get('llm', {}).get('max_tokens', 1000) if hasattr(self, 'config') else 1000)
+                    )
+                    
+                    answer = llm_response.get('content', "I couldn't generate an answer at this time.")
+                    
+                    result = {
+                        "agent": self.name,
+                        "query_type": "question",
+                        "question": question,
+                        "answer": answer,
+                        "format": self.answer_format,
+                        "processing_time": round(time.time() - start_time, 2),
+                        "source": "llm_with_context" if memory_context else "llm_direct"
+                    }
+                    
+                    if memory_context:
+                        result["context_sources"] = len(memory_context)
+                        
+                    return result
+                except Exception as e:
+                    logger.error(f"Error in LLM processing: {e}")
+                    # Fall back to non-LLM processing
+                    return self.process_message(message)
+            else:
+                # Fallback to non-LLM processing
+                return self.process_message(message)
+                
+        except Exception as e:
+            logger.error(f"Error in Question Answering Agent async processing: {e}")
+            return {
+                "agent": self.name,
+                "error": str(e),
+                "query": question if 'question' in locals() else "unknown query"
+            }
     
     def process_message(self, message) -> Optional[Dict[str, Any]]:
         """
-        Process domain-specific queries
+        Fallback for processing without LLM
         
         Args:
-            message: The message to process (dict in containerized version)
+            message: The message to process
             
         Returns:
-            Response data
+            Response data with a simple answer
         """
         try:
             # Handle both Message objects and dictionary messages (for container compatibility)
             if hasattr(message, 'content'):
-                content = message.content
+                question = message.content
                 message_id = getattr(message, 'id', 'unknown')
             else:
-                content = message.get('content', '')
+                question = message.get('content', '')
                 message_id = message.get('id', 'unknown')
-                
-            query = content.lower()
             
-            # Log the message being processed
-            logger.info(f"Processing message {message_id} with content: '{content[:50]}...'")
-            
-            # Domain for {domain}
-            # Add your domain-specific processing logic here
-            
-            # Example pattern matching for various domain queries
-            if 'help' in query or 'hello' in query:
+            # Simple question detection
+            is_question = False
+            for pattern in self.question_patterns:
+                if pattern.search(question):
+                    is_question = True
+                    break
+                    
+            if not is_question:
+                # Not a question, provide a generic response
                 return {
                     "agent": self.name,
-                    "response": f"Hello! I'm {self.name}, an agent that {self.description.lower()}. How can I help you?"
+                    "query_type": "non_question",
+                    "message": f"I don't recognize that as a question. Please try rephrasing as a question."
                 }
-            elif '{domain}' in query:
-                return {
-                    "agent": self.name,
-                    "response": f"I detected a {domain} related query: {content}"
-                }
-            #
-            # Example:
-            # if "weather" in query and ("forecast" in query or "today" in query):
-            #     return {
-            #         "agent": self.name,
-            #         "query_type": "weather_forecast",
-            #         "forecast": "Sunny with a high of 72°F"
-            #     }}
             
-            # Default response if no pattern matches
+            # Simple question answering without LLM
+            simple_answers = {
+                "what is your name": f"My name is {self.name}.",
+                "who are you": f"I am {self.name}, an AI agent designed to answer questions.",
+                "what can you do": "I can answer questions on a wide range of topics. Without my LLM connection, my capabilities are limited though.",
+                "help": "I'm designed to answer questions. Please ask me something specific.",
+            }
+            
+            # Try to find a simple answer match
+            question_lower = question.lower().strip('?!., ')
+            for key, answer in simple_answers.items():
+                if key in question_lower:
+                    return {
+                        "agent": self.name,
+                        "query_type": "question",
+                        "question": question,
+                        "answer": answer,
+                        "source": "fallback"
+                    }
+            
+            # Generic fallback response for questions
             return {
                 "agent": self.name,
-                "query_type": "general_response",
-                "response": f"I received your query in the {domain} domain. This is a placeholder response."
+                "query_type": "question",
+                "question": question,
+                "answer": "I'm sorry, I can't provide a detailed answer without my LLM connection. Please try again later.",
+                "source": "fallback"
             }
             
         except Exception as e:
-            logger.error(f"Error in Question_answering_agent Agent processing: {e}")
+            logger.error(f"Error in Question Answering Agent processing: {e}")
             return {
                 "agent": self.name,
                 "error": str(e),
-                "query": content if 'content' in locals() else "unknown query"
+                "query": question if 'question' in locals() else "unknown query"
             }
+    
+    def _retrieve_relevant_context(self, question: str, max_items: int = 5, threshold: float = 0.65) -> List[Dict[str, Any]]:
+        """
+        Retrieve relevant context from memory system
+        
+        Args:
+            question: The question to find context for
+            max_items: Maximum number of memory items to retrieve
+            threshold: Similarity threshold for retrieval
+            
+        Returns:
+            List of relevant memory items
+        """
+        try:
+            memory_system = get_memory_system()
+            if not memory_system:
+                return []
+                
+            # Search for similar memory items
+            results = memory_system.search_similar(question, k=max_items, threshold=threshold)
+            
+            # Extract and format the memory items
+            context_items = []
+            for item in results:
+                context_items.append({
+                    "content": item.content,
+                    "tags": item.tags,
+                    "title": item.title,
+                    "similarity": item.similarity
+                })
+                
+            logger.debug(f"Retrieved {len(context_items)} context items for question: {question[:50]}...")
+            return context_items
+        except Exception as e:
+            logger.error(f"Error retrieving context: {e}")
+            return []
+            
+    def _get_enhanced_system_prompt(self, context_items: List[Dict[str, Any]]) -> str:
+        """
+        Enhance the system prompt with relevant context
+        
+        Args:
+            context_items: List of relevant memory items
+            
+        Returns:
+            Enhanced system prompt
+        """
+        # Get the base system prompt
+        default_prompt = "You are an AI assistant specializing in answering questions. Provide accurate, helpful, and concise answers."
+        base_prompt = self.config.get('llm', {}).get('system_prompt', default_prompt) if hasattr(self, 'config') else default_prompt
+        
+        # If no context, return the base prompt
+        if not context_items:
+            return base_prompt
+            
+        # Add context to the prompt
+        context_parts = []
+        context_parts.append(base_prompt)
+        context_parts.append("\n\nYou have access to the following relevant information that may help you answer the question.")
+        context_parts.append("Use this information if relevant to the question:\n")
+        
+        # Add each context item
+        for i, item in enumerate(context_items):
+            context_parts.append(f"Context {i+1}: {item['content']}\n")
+            
+        # Add closing instructions
+        context_parts.append("\nEnd of context information.\n")
+        context_parts.append("If the context doesn't contain information relevant to the question, just answer based on your knowledge.")
+        context_parts.append("Do not disclose that you were given any context information.")
+        
+        # Join all parts into the final prompt
+        return '\n'.join(context_parts)
 
 
 # For standalone testing
@@ -184,7 +459,7 @@ if __name__ == "__main__":
     )
     
     # Create the agent
-    agent = Question_answering_agentAgent()
+    agent = QuestionAnsweringAgent()
     print(f"Agent created: {agent.name}")
     
     # Test classifier setup
