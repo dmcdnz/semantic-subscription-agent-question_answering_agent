@@ -21,12 +21,47 @@ module_name = f"agent"
 try:
     import importlib
     agent_module = importlib.import_module(module_name)
-    AgentClass = getattr(agent_module, f"{agent_class_name}Agent")
-    print(f"Successfully imported {agent_class_name}Agent from {module_name}")
+    # Try different variations of the agent class name
+    try:
+        # First try the configured class name
+        AgentClass = getattr(agent_module, f"{agent_class_name}")
+        print(f"Successfully imported {agent_class_name} from {module_name}")
+    except AttributeError:
+        # Try with Agent suffix
+        try:
+            AgentClass = getattr(agent_module, f"{agent_class_name}Agent")
+            print(f"Successfully imported {agent_class_name}Agent from {module_name}")
+        except AttributeError:
+            # Last try - QuestionAnsweringAgent
+            AgentClass = getattr(agent_module, "QuestionAnsweringAgent")
+            print(f"Successfully imported QuestionAnsweringAgent from {module_name}")
 except Exception as e:
-    # Fallback to base implementation
-    from agent import BaseAgent as AgentClass
-    print(f"Warning: Using fallback BaseAgent: {e}")
+    # Create a minimal agent class if all imports fail
+    print(f"Warning: Failed to import agent class: {e}")
+    
+    # Define a simple BaseAgent class dynamically
+    class SimpleAgent:
+        def __init__(self, agent_id=None, name=None, description=None, **kwargs):
+            self.agent_id = agent_id or "question_answering_agent"
+            self.name = name or "Question Answering Agent"
+            self.description = description or "Detects and answers questions using an LLM"
+            self.similarity_threshold = kwargs.get('similarity_threshold', 0.7)
+            self.classifier_threshold = kwargs.get('classifier_threshold', 0.5)
+            self.use_classifier = kwargs.get('use_classifier', True)
+            print(f"Created fallback SimpleAgent with name: {self.name}")
+        
+        def calculate_interest(self, message):
+            # Simple implementation that always shows low interest
+            return 0.1
+            
+        def process_message(self, message):
+            # Simple implementation that returns a basic response
+            return {
+                "agent": self.name,
+                "result": "This is a fallback response from the SimpleAgent"
+            }
+    
+    AgentClass = SimpleAgent
 
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

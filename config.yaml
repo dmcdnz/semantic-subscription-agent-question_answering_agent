@@ -1,6 +1,6 @@
 agent:
-  name: Question_answering_agent Agent
-  class_name: Question_answering_agentAgent
+  name: Question Answering Agent
+  class_name: QuestionAnsweringAgent
   package_name: question_answering_agent
   domain: general knowledge question answering
   description: Detects and answers questions using an LLM

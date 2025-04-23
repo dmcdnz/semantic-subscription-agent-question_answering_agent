@@ -46,6 +46,28 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Add BaseAgent class as fallback for container imports
+class BaseAgent:
+    """
+    Base Agent class - Fallback for container imports 
+    """
+    def __init__(self, agent_id=None, name=None, description=None, 
+                 similarity_threshold=0.7, use_classifier=True, **kwargs):
+        self.agent_id = agent_id or "question_answering_agent"  
+        self.name = name or "Question Answering Agent"
+        self.description = description or "Detects and answers questions using an LLM"
+        self.similarity_threshold = similarity_threshold
+        self.use_classifier = use_classifier
+        self.classifier_threshold = kwargs.get('classifier_threshold', 0.5)
+        logger.info(f"BaseAgent (fallback) initialized with id: {self.agent_id}")
+    
+    def calculate_interest(self, message):
+        return 0.0  # Default no interest
+        
+    def process_message(self, message):
+        logger.warning(f"BaseAgent fallback called - no processing implemented")
+        return {"error": "Fallback agent does not implement processing"}
+
 class QuestionAnsweringAgent(LLMAgent):
     """
     Agent that detects and answers questions using an LLM
