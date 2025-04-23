@@ -21,47 +21,48 @@ module_name = f"agent"
 try:
     import importlib
     agent_module = importlib.import_module(module_name)
-    # Try different variations of the agent class name
-    try:
-        # First try the configured class name
-        AgentClass = getattr(agent_module, f"{agent_class_name}")
-        print(f"Successfully imported {agent_class_name} from {module_name}")
-    except AttributeError:
-        # Try with Agent suffix
+    # Try multiple class name patterns in order:
+    # 1. ExactClassName as in config
+    # 2. ClassNameAgent (with Agent suffix)
+    # 3. BaseAgent as a fallback
+    for class_attempt in [agent_class_name, f"{agent_class_name}Agent", "BaseAgent"]:
         try:
-            AgentClass = getattr(agent_module, f"{agent_class_name}Agent")
-            print(f"Successfully imported {agent_class_name}Agent from {module_name}")
+            AgentClass = getattr(agent_module, class_attempt)
+            print(f"Successfully imported {class_attempt} from {module_name}")
+            break
         except AttributeError:
-            # Last try - QuestionAnsweringAgent
-            AgentClass = getattr(agent_module, "QuestionAnsweringAgent")
-            print(f"Successfully imported QuestionAnsweringAgent from {module_name}")
+            continue
+    else:
+        # If the loop completes without finding a class, try one more approach
+        # Sometimes classes might be defined with unexpected capitalization
+        for name in dir(agent_module):
+            if name.lower() == agent_class_name.lower() or \
+               name.lower() == f"{agent_class_name.lower()}agent":
+                AgentClass = getattr(agent_module, name)
+                print(f"Successfully imported {name} from {module_name} using case-insensitive match")
+                break
+        else:
+            # If all attempts fail, create a minimal agent class
+            class MinimalAgent:
+                def __init__(self, **kwargs):
+                    self.classifier_threshold = 0.5
+                def calculate_interest(self, message):
+                    return 0.0
+                def process_message(self, message):
+                    return {"error": "Agent class not properly defined"}
+            AgentClass = MinimalAgent
+            print(f"Warning: Using minimal agent implementation - no suitable class found in {module_name}")
 except Exception as e:
-    # Create a minimal agent class if all imports fail
-    print(f"Warning: Failed to import agent class: {e}")
-    
-    # Define a simple BaseAgent class dynamically
-    class SimpleAgent:
-        def __init__(self, agent_id=None, name=None, description=None, **kwargs):
-            self.agent_id = agent_id or "question_answering_agent"
-            self.name = name or "Question Answering Agent"
-            self.description = description or "Detects and answers questions using an LLM"
-            self.similarity_threshold = kwargs.get('similarity_threshold', 0.7)
-            self.classifier_threshold = kwargs.get('classifier_threshold', 0.5)
-            self.use_classifier = kwargs.get('use_classifier', True)
-            print(f"Created fallback SimpleAgent with name: {self.name}")
-        
+    # Create a minimal agent if everything else fails
+    class MinimalAgent:
+        def __init__(self, **kwargs):
+            self.classifier_threshold = 0.5
         def calculate_interest(self, message):
-            # Simple implementation that always shows low interest
-            return 0.1
-            
+            return 0.0
         def process_message(self, message):
-            # Simple implementation that returns a basic response
-            return {
-                "agent": self.name,
-                "result": "This is a fallback response from the SimpleAgent"
-            }
-    
-    AgentClass = SimpleAgent
+            return {"error": "Agent class not properly defined"}
+    AgentClass = MinimalAgent
+    print(f"Warning: Could not import agent module: {e}")
 
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -127,7 +128,7 @@ def subscribe_to_events():
             json={
                 "agent_id": AGENT_ID,
                 "name": AGENT_NAME,
-                "events": ["message.new"],
+                "events": ["message.created"],
                 "callback_url": f"{CORE_API_URL}/api/messages/process"
             }
         )
